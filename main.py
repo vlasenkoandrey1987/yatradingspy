@@ -5,6 +5,10 @@ import sys
 import threading
 import time
 
+import requests
+from ccxt import binance
+from dotenv import load_dotenv
+
 
 class State(enum.Enum):
     INITIAL = 0
@@ -17,17 +21,78 @@ state_lock = threading.Lock()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+load_dotenv()
+
+BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
+BINANCE_PRIVATE_KEY = os.getenv('BINANCE_PRIVATE_KEY')
+BINANCE_MARKET_TYPE = os.getenv('BINANCE_MARKET_TYPE')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+MARKET_ID = 'BTCUSDT'
+
+RETRY_TIME = 10
+ENDPOINT = 'https://api.telegram.org/bot{token}/sendMessage'
+
+MESSAGE = 'symbol: {symbol}, amount: {amount}, entry price: {entry_price}'
+
 
 def main():
-    while True:
-        logging.info('event')
-        state_lock.acquire()
-        if state == State.STOPPED:
-            state_lock.release()
-            break
-        state_lock.release()
+    exchange = binance({
+        'apiKey': BINANCE_API_KEY,
+        'secret': BINANCE_PRIVATE_KEY,
+        'timeout': 10000,  # number in milliseconds
+        'enableRateLimit': True,
+        'options': {
+            # 'spot', 'future', 'margin', 'delivery'
+            'defaultType': BINANCE_MARKET_TYPE,
+        }
+    })
 
-        time.sleep(10)
+    global state
+    with state_lock:
+        state = State.RUNNING
+
+    current_report = None
+    prev_report = current_report
+
+    while True:
+        with state_lock:
+            if state == State.STOPPED:
+                break
+
+        logging.info('Запрашиваем позицию по инструменту %s', MARKET_ID)
+        # 'https://api.binance.com/fapi/v1/positionRisk'
+        response = exchange.fapiPrivate_get_positionrisk(
+            params={'symbol': MARKET_ID}
+        )
+        position = response[0]
+        current_report = MESSAGE.format(
+            symbol=MARKET_ID,
+            amount=position['positionAmt'],
+            entry_price=position['entryPrice'],
+        )
+        if current_report == prev_report:
+            logging.debug(
+                'Нет обновлений позиции по инструменту %s', MARKET_ID
+            )
+
+        if current_report != prev_report:
+            logging.info(
+                'Отправляем сообщение в телеграм: %s', current_report
+            )
+            requests.post(
+                url=ENDPOINT.format(token=TELEGRAM_TOKEN),
+                data={
+                    'chat_id': TELEGRAM_CHAT_ID,
+                    'text': current_report,
+                    'parse_mode': 'markdown',
+                },
+            )
+            logging.info('Сообщение в телеграм успешно отправлено')
+            prev_report = current_report
+
+        time.sleep(RETRY_TIME)
 
 
 def repl():  # read eval print loop
@@ -35,9 +100,8 @@ def repl():  # read eval print loop
     while True:
         command = input('Please, press "s" to stop')
         if command == 's':
-            state_lock.acquire()
-            state = State.STOPPED
-            state_lock.release()
+            with state_lock:
+                state = State.STOPPED
             break
 
 
